@@ -65,22 +65,87 @@ document_contour = sorted_contours[0]
 # Calculate perimeter
 perimeter = cv2.arcLength(document_contour, True)
 
-# Try different approximation tolerances
-approx1 = cv2.approxPolyDP(
-    document_contour, 0.01 * perimeter, True
-)
 
-approx2 = cv2.approxPolyDP(
-    document_contour, 0.02 * perimeter, True
-)
-
-approx3 = cv2.approxPolyDP(
+approx = cv2.approxPolyDP(
     document_contour, 0.04 * perimeter, True
 )
+for point in approx:
+    x, y = point[0]
+    cv2.circle(img_copy, (x, y), 15, (0, 0, 255), -1)
 
-print("Epsilon 0.01:", len(approx1))
-print("Epsilon 0.02:", len(approx2))
-print("Epsilon 0.04:", len(approx3))
+cv2.imshow('Image corners', resize_img(img_copy))
 
+#reordering points;
+import numpy as np
+
+def reorder_points(points):
+
+    points = points.reshape(4, 2)
+
+    ordered = np.zeros((4, 2), dtype=np.float32)
+
+    # Calculate sums
+    s = points.sum(axis=1)
+
+    # Calculate differences (y - x)
+    d = np.diff(points, axis=1).flatten()
+
+    ordered[0] = points[np.argmin(s)]  # Top-left
+    ordered[1] = points[np.argmin(d)]  # Top-right
+    ordered[2] = points[np.argmax(d)]  # Bottom-left
+    ordered[3] = points[np.argmax(s)]  # Bottom-right
+
+    return ordered
+ordered_points = reorder_points(approx)
+
+import numpy as np
+
+# Source points
+pts = ordered_points
+
+# Reorder for perspective transformation
+src = np.array([
+    pts[0],  # Top-left
+    pts[1],  # Top-right
+    pts[3],  # Bottom-right
+    pts[2]   # Bottom-left
+], dtype=np.float32)
+
+
+# Calculate output width
+width_top = np.linalg.norm(src[1] - src[0])
+width_bottom = np.linalg.norm(src[2] - src[3])
+
+max_width = int(max(width_top, width_bottom))
+
+
+# Calculate output height
+height_left = np.linalg.norm(src[3] - src[0])
+height_right = np.linalg.norm(src[2] - src[1])
+
+max_height = int(max(height_left, height_right))
+
+
+# Destination points
+dst = np.array([
+    [0, 0],
+    [max_width - 1, 0],
+    [max_width - 1, max_height - 1],
+    [0, max_height - 1]
+], dtype=np.float32)
+
+
+# Calculate transformation matrix
+matrix = cv2.getPerspectiveTransform(src, dst)
+
+
+# Apply perspective transformation
+warped = cv2.warpPerspective(
+    img,
+    matrix,
+    (max_width, max_height)
+)
+
+cv2.imshow("Scanned Document", resize_img(warped))
 cv2.waitKey(0)
 cv2.destroyAllWindows()
