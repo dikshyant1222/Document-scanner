@@ -7,7 +7,7 @@ def resize_img(img):
     return cv2.resize(img, (800, 1100))
 
 
-img = cv2.imread('imig.jpg')
+img = cv2.imread('image fix.jpg')
 #cv2.imshow('Original Image', resize_img(img))
 
 
@@ -44,8 +44,6 @@ cleaned = cv2.morphologyEx(
     iterations=1
 )
 
-cv2.imshow("Original Mask", resize_img(mask))
-cv2.imshow("Cleaned Mask", resize_img(cleaned))
 
 
 #contour filtering
@@ -57,7 +55,7 @@ largest_contours = sorted_contours[:1]
 img_copy = img.copy()
 
 cv2.drawContours(img_copy, largest_contours, -1, (0,255,0), 2)
-cv2.imshow('Contours_original', resize_img(img_copy))
+
 
 
 document_contour = sorted_contours[0]
@@ -73,7 +71,7 @@ for point in approx:
     x, y = point[0]
     cv2.circle(img_copy, (x, y), 15, (0, 0, 255), -1)
 
-cv2.imshow('Image corners', resize_img(img_copy))
+
 
 #reordering points;
 import numpy as np
@@ -145,7 +143,32 @@ warped = cv2.warpPerspective(
     matrix,
     (max_width, max_height)
 )
+warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+clahe = cv2.createCLAHE(
+    clipLimit=1.0,
+    tileGridSize=(8, 8)
+)
+denoised = cv2.fastNlMeansDenoising(
+    warped_gray,
+    None,
+    8,
+    7,
+    21
+)
+# Apply contrast enhancement
+enhanced = clahe.apply(denoised)
 
+adaptive = cv2.adaptiveThreshold(
+    enhanced,
+    255,
+    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+    cv2.THRESH_BINARY,
+    21,
+    10
+)
+cv2.imshow("Before CLAHE", resize_img(warped_gray))
+cv2.imshow("After CLAHE", resize_img(enhanced))
 cv2.imshow("Scanned Document", resize_img(warped))
+cv2.imshow('Adaptive Image', resize_img(adaptive))
 cv2.waitKey(0)
 cv2.destroyAllWindows()
