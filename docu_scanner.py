@@ -1,5 +1,7 @@
 
 
+import argparse
+
 import cv2
 
 
@@ -7,7 +9,13 @@ def resize_img(img):
     return cv2.resize(img, (800, 1100))
 
 
-img = cv2.imread('image fix.jpg')
+parser = argparse.ArgumentParser(description='Scan a document from an image.')
+parser.add_argument('image', nargs='?', default='imig.jpg', help='Path to the document image to scan.')
+arguments = parser.parse_args()
+
+img = cv2.imread(arguments.image)
+if img is None:
+    parser.error(f'Could not read image: {arguments.image}')
 #cv2.imshow('Original Image', resize_img(img))
 
 
@@ -166,9 +174,7 @@ adaptive = cv2.adaptiveThreshold(
     21,
     10
 )
-cv2.imshow("Before CLAHE", resize_img(warped_gray))
-cv2.imshow("After CLAHE", resize_img(enhanced))
-cv2.imshow("Scanned Document", resize_img(warped))
-cv2.imshow('Adaptive Image', resize_img(adaptive))
+
+cv2.imshow('Scanned Image', resize_img(adaptive))
 cv2.waitKey(0)
 cv2.destroyAllWindows()
