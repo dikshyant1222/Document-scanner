@@ -8,23 +8,56 @@ import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 import streamlit as st
 
-from docu_scanner import (
-    MAX_PROCESSING_DIMENSION, enhance_document, find_document_corners, warp_document,
-)
-from scan_widgets import compare_scans, corner_editor, image_data_uri
+from docu_scanner import MAX_PROCESSING_DIMENSION, scan_document
 
 
 MAX_UPLOAD_MB = 20
-MAX_SOURCE_PIXELS = 40_000_000
+MAX_SOURCE_PIXELS = 200_000_000
+# Align Pillow's finite bomb guard with our explicit source-metadata limit.
+Image.MAX_IMAGE_PIXELS = MAX_SOURCE_PIXELS
 SUPPORTED_FORMATS = ('JPEG', 'PNG', 'WEBP', 'BMP')
-STYLE_LABELS = {'Black-and-white': 'black-and-white', 'Grayscale': 'grayscale', 'Color': 'color'}
-DEFAULT_SETTINGS = {
-    'style': 'Black-and-white',
-    'remove_shadows': False,
-    'denoise_strength': 8,
-    'contrast': 1.0,
-    'threshold_offset': 10,
+
+
+class ScanProcessingError(Exception):
+    """A scanner failure safe to summarize without exposing low-level details."""
+
+
+class ScanEncodingError(Exception):
+    """A failure while preparing the in-memory PNG download."""
+
+
+class ScanProcessingMemoryError(ScanProcessingError):
+    """A memory failure while creating the scan."""
+
+
+class ScanEncodingMemoryError(ScanEncodingError):
+    """A memory failure while preparing the in-memory PNG download."""
+
+
+RESULT_STYLES = '''
+<style>
+.st-key-rescue_upload_panel {
+    margin-bottom: 0.5rem;
 }
+.st-key-rescue_upload_panel [data-testid="stFileUploader"] button,
+.st-key-rescue_result [data-testid="stDownloadButton"] button {
+    min-height: 44px;
+}
+.st-key-rescue_result,
+.st-key-rescue_result [data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 0.9rem;
+}
+.st-key-rescue_result [data-testid="stImage"] img {
+    display: block;
+    width: auto !important;
+    max-width: 100%;
+    height: auto !important;
+    max-height: min(65vh, 36rem);
+    margin-inline: auto;
+    object-fit: contain;
+}
+</style>
+'''
 
 
 def decode_image(image_bytes):
@@ -41,20 +74,27 @@ def decode_image(image_bytes):
                 if image.width * image.height > MAX_SOURCE_PIXELS:
                     raise ValueError(
                         'This image is too large to process safely. '
-                        'Please resize it to 40 million pixels or fewer.'
+                        'Please resize it to 200 million pixels or fewer.'
                     )
                 if min(image.size) < 3:
                     raise ValueError('The image must be at least 3 pixels wide and tall.')
-                oriented = ImageOps.exif_transpose(image)
-                oriented.thumbnail(
-                    (MAX_PROCESSING_DIMENSION, MAX_PROCESSING_DIMENSION),
-                    Image.Resampling.LANCZOS,
-                )
-                if min(oriented.size) < 3:
+                # Reject ratios that stay below 3 pixels even when rounded up.
+                if min(image.size) * MAX_PROCESSING_DIMENSION <= 2 * max(image.size):
                     raise ValueError(
                         'This image is too narrow after resizing. '
                         'Please crop it or choose a less elongated photo.'
                     )
+                # Resize lazily so JPEG draft decoding precedes EXIF/color copies.
+                image.thumbnail(
+                    (MAX_PROCESSING_DIMENSION, MAX_PROCESSING_DIMENSION),
+                    Image.Resampling.LANCZOS,
+                )
+                if min(image.size) < 3:
+                    raise ValueError(
+                        'This image is too narrow after resizing. '
+                        'Please crop it or choose a less elongated photo.'
+                    )
+                oriented = ImageOps.exif_transpose(image)
                 if 'A' in oriented.getbands() or 'transparency' in oriented.info:
                     transparent = oriented.convert('RGBA')
                     background = Image.new('RGBA', transparent.size, 'white')
@@ -64,7 +104,12 @@ def decode_image(image_bytes):
                 return np.array(rgb, dtype=np.uint8)
     except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
         raise ValueError(
-            'This image is too large to process safely. Please upload a smaller image.'
+            'This image is too large to process safely. '
+            'Please resize it to 200 million pixels or fewer.'
+        ) from error
+    except MemoryError as error:
+        raise ValueError(
+            'Not enough memory to read this image. Please resize it or choose a smaller photo.'
         ) from error
     except (UnidentifiedImageError, OSError, SyntaxError) as error:
         raise ValueError(
@@ -74,231 +119,142 @@ def decode_image(image_bytes):
 
 def clear_studio():
     for key in list(st.session_state):
-        if key.startswith('rescue_'):
+        if key.startswith('rescue_') and key != 'rescue_upload':
             del st.session_state[key]
 
 
-def normalized_corners(corners, image_shape):
-    height, width = image_shape[:2]
-    return (np.asarray(corners, dtype=np.float64) / [width - 1, height - 1]).tolist()
-
-
-def pixel_corners(corners, image_shape):
+def initialize_studio(original, upload_id, upload_name):
+    """Create a complete default scan before exposing any new session result."""
     try:
-        points = np.asarray(corners, dtype=np.float64)
-    except (TypeError, ValueError) as error:
-        raise ValueError('Place four distinct handles on the page corners.') from error
-    if points.shape != (4, 2) or not np.isfinite(points).all():
-        raise ValueError('Place four valid handles on the page corners.')
-    if (points < 0).any() or (points > 1).any():
-        raise ValueError('Keep every corner handle inside the image.')
-    height, width = image_shape[:2]
-    return (points * [width - 1, height - 1]).astype(np.float32)
-
-
-def same_corners(first, second):
-    try:
-        first_points = np.asarray(first, dtype=np.float64)
-        second_points = np.asarray(second, dtype=np.float64)
-        return first_points.shape == second_points.shape and np.allclose(
-            first_points, second_points, rtol=0, atol=1e-8,
-        )
-    except (TypeError, ValueError):
-        return False
-
-
-def apply_scan(studio, settings):
-    image = cv2.cvtColor(studio['original'], cv2.COLOR_RGB2BGR)
-    corners = studio['draft_corners'] if studio['manual_corners'] else studio['auto_corners']
-    page = warp_document(image, pixel_corners(corners, image.shape)) if corners is not None else image
-    scanned = enhance_document(
-        page, **{**settings, 'style': STYLE_LABELS[settings['style']]},
-    )
-    encoded, png = cv2.imencode('.png', scanned)
-    if not encoded:
-        raise ValueError('Could not prepare the PNG download. Please try another image.')
-    before_uri = image_data_uri(page, bgr=True)
-    after_uri = image_data_uri(scanned, bgr=settings['style'] == 'Color')
-    studio.update({
-        'scanned': scanned,
-        'png': png.tobytes(),
-        'before_uri': before_uri,
-        'after_uri': after_uri,
-        'corrected': corners is not None,
-        'applied_corners': [list(point) for point in studio['draft_corners']],
-        'applied_manual': studio['manual_corners'],
-        'applied_settings': dict(settings),
-        'error': None,
-    })
-
-
-def seed_settings():
-    for name, value in DEFAULT_SETTINGS.items():
-        st.session_state['rescue_setting_' + name] = value
-
-
-def initialize_studio(original, upload_id):
-    image = cv2.cvtColor(original, cv2.COLOR_RGB2BGR)
-    detected = find_document_corners(image)
-    if detected is not None:
-        try:
-            warp_document(image, detected)
-        except ValueError:
-            detected = None
-    automatic = normalized_corners(detected, image.shape) if detected is not None else None
-    studio = {
-        'upload_id': upload_id,
-        'original': original,
-        'image_uri': image_data_uri(original),
-        'auto_corners': automatic,
-        'draft_corners': automatic or [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-        'manual_corners': False,
-        'editor_revision': 0,
-    }
-    apply_scan(studio, DEFAULT_SETTINGS)
-    seed_settings()
-    return studio
-
-
-def reset_studio():
-    studio = st.session_state['rescue_studio']
-    studio['draft_corners'] = studio['auto_corners'] or [
-        [0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0],
-    ]
-    studio['manual_corners'] = False
-    studio['editor_revision'] += 1
-    seed_settings()
-    try:
-        apply_scan(studio, DEFAULT_SETTINGS)
+        image = cv2.cvtColor(original, cv2.COLOR_RGB2BGR)
+        scanned, corrected = scan_document(image)
+    except MemoryError as error:
+        raise ScanProcessingMemoryError from error
     except (ValueError, cv2.error) as error:
-        studio['error'] = f'Could not reset the scan: {error}'
+        raise ScanProcessingError from error
+
+    if not isinstance(scanned, np.ndarray) or scanned.dtype != np.uint8 or scanned.ndim != 2:
+        raise ScanProcessingError
+
+    try:
+        encoded, png = cv2.imencode('.png', scanned)
+        if not encoded:
+            raise ScanEncodingError
+        png_bytes = png.tobytes()
+    except ScanEncodingError:
+        raise
+    except MemoryError as error:
+        raise ScanEncodingMemoryError from error
+    except (ValueError, cv2.error) as error:
+        raise ScanEncodingError from error
+
+    height, width = scanned.shape
+    filename = Path(upload_name).stem or 'document'
+    return {
+        'upload_id': upload_id,
+        'scanned': scanned,
+        'png': png_bytes,
+        'corrected': bool(corrected),
+        'width': width,
+        'height': height,
+        'download_name': f'{filename}_scanned.png',
+        'mime': 'image/png',
+    }
 
 
 def main():
-    st.set_page_config(page_title='Scan Rescue Studio', page_icon='📄', layout='wide')
-    st.title('Scan Rescue Studio')
-    st.write('Fix page corners, rescue uneven lighting, and choose your scan style.')
-    st.caption('Upload → Adjust → Apply → Download · One image at a time · Processed on this computer')
-    uploaded_file = st.file_uploader(
-        'Upload a document photo', type=['jpg', 'jpeg', 'png', 'webp', 'bmp'],
-        accept_multiple_files=False, max_upload_size=MAX_UPLOAD_MB,
-        help='Up to 20 MB and 40 million pixels. Include the full page when possible.',
-        key='document_upload',
-    )
-    st.caption(
-        'Images stay in memory on this computer. Processing is capped at a '
-        '2,000-pixel long edge; nothing is saved until you download it.'
-    )
-    if uploaded_file is None:
-        clear_studio()
-        st.info('Upload a photo to start. Your first scan is generated automatically.')
-        return
+    st.set_page_config(page_title='Scan Rescue Studio', page_icon='📄', layout='centered')
+    st.html(RESULT_STYLES)
+    with st.container(key='rescue_intro'):
+        st.title('Scan Rescue Studio')
+        st.write('Add a document photo and get a clean black-and-white scan automatically.')
+    with st.container(key='rescue_upload_panel'):
+        uploaded_file = st.file_uploader(
+            'Add a document image', type=['jpg', 'jpeg', 'png', 'webp', 'bmp'],
+            accept_multiple_files=False, max_upload_size=MAX_UPLOAD_MB,
+            help=(
+                'Up to 20 MB and 200 million source pixels. Photos are automatically '
+                'downsized to at most a 2,000-pixel long edge for processing and downloads. '
+                'Include the full page when possible.'
+            ),
+            key='rescue_upload',
+        )
+        st.caption(
+            'One image at a time · Kept in memory for this session · Nothing is saved '
+            'until you download it'
+        )
 
-    image_bytes = uploaded_file.getvalue()
-    upload_id = sha256(image_bytes).hexdigest() + ':' + uploaded_file.name
-    studio = st.session_state.get('rescue_studio')
-    if studio is None or studio['upload_id'] != upload_id:
-        clear_studio()
+    result_slot = st.empty()
+    with result_slot.container(key='rescue_result', border=True):
+        if uploaded_file is None:
+            clear_studio()
+            st.info('Add a JPG, PNG, WebP, or BMP image to create your scan.')
+            return
+
         try:
-            with st.spinner('Finding the page and generating your first scan…'):
-                studio = initialize_studio(decode_image(image_bytes), upload_id)
+            image_bytes = uploaded_file.getvalue()
+            upload_name = str(uploaded_file.name)
+            upload_id = sha256(image_bytes).hexdigest() + ':' + upload_name
+        except MemoryError:
+            clear_studio()
+            st.error(
+                'Not enough memory to read this image. '
+                'Please resize it or choose a smaller photo.'
+            )
+            return
+
+        studio = st.session_state.get('rescue_studio')
+        if not isinstance(studio, dict) or studio.get('upload_id') != upload_id:
+            clear_studio()
+            try:
+                with st.spinner('Creating your scan…'):
+                    studio = initialize_studio(
+                        decode_image(image_bytes), upload_id, upload_name,
+                    )
+            except ScanEncodingMemoryError:
+                st.error(
+                    'Not enough memory to prepare the PNG download. '
+                    'Please resize the image or choose a smaller photo.'
+                )
+                return
+            except ScanProcessingMemoryError:
+                st.error(
+                    'Not enough memory to scan this image. '
+                    'Please resize it or choose a smaller photo.'
+                )
+                return
+            except ScanEncodingError:
+                st.error('Could not prepare the PNG download. Please try another image.')
+                return
+            except ScanProcessingError:
+                st.error('Could not scan this image. Please try a clearer or smaller photo.')
+                return
+            except ValueError as error:
+                st.error(str(error))
+                return
+            except MemoryError:
+                st.error(
+                    'Not enough memory to scan this image. '
+                    'Please resize it or choose a smaller photo.'
+                )
+                return
+
             st.session_state['rescue_studio'] = studio
-        except ValueError as error:
-            st.error(str(error))
-            return
-        except cv2.error:
-            st.error('Could not process this image. Please try a clearer or smaller photo.')
-            return
 
-    editor_column, settings_column = st.columns([2, 1], gap='large')
-    with editor_column:
-        st.subheader('1. Adjust page corners')
-        if studio['auto_corners'] is None:
-            st.caption('No page boundary detected. Move the handles to rescue it, or keep the whole image.')
-        editor_key = f"rescue_editor_{studio['upload_id']}_{studio['editor_revision']}"
-        stored_draft = st.session_state.get(editor_key, {}).get('corners')
-        if stored_draft is not None and not same_corners(stored_draft, studio['draft_corners']):
-            studio['draft_corners'] = stored_draft
-            studio['manual_corners'] = True
-            studio['error'] = None
-        draft = corner_editor(
-            studio['image_uri'], studio['draft_corners'], studio['original'].shape,
-            key=editor_key,
-        )
-        if draft is not None and not same_corners(draft, studio['draft_corners']):
-            studio['draft_corners'] = draft
-            studio['manual_corners'] = True
-            studio['error'] = None
-        with st.expander('View original photo'):
-            st.image(studio['original'], width='stretch')
-
-    with settings_column:
-        st.subheader('2. Tune your scan')
-        settings = {
-            'style': st.selectbox('Scan style', list(STYLE_LABELS), key='rescue_setting_style'),
-            'remove_shadows': st.toggle(
-                'Shadow cleanup', key='rescue_setting_remove_shadows',
-                help='Normalize uneven lighting. This may alter photos or colored paper.',
-            ),
-            'denoise_strength': st.slider(
-                'Noise cleanup', 0, 15, step=1, key='rescue_setting_denoise_strength',
-                help='Higher values smooth more noise but can soften fine details.',
-            ),
-            'contrast': st.slider(
-                'Contrast', 1.0, 3.0, step=0.1, key='rescue_setting_contrast',
-            ),
-        }
-        settings['threshold_offset'] = st.slider(
-            'Paper whitening', 0, 20, step=1, key='rescue_setting_threshold_offset',
-            disabled=settings['style'] != 'Black-and-white',
-            help='Higher values whiten more of the page; lower values retain lighter marks.',
-        )
-        studio['draft_settings'] = dict(settings)
-        dirty = (
-            settings != studio['applied_settings']
-            or studio['manual_corners'] != studio['applied_manual']
-            or not same_corners(studio['draft_corners'], studio['applied_corners'])
-        )
-        apply_column, reset_column = st.columns(2)
-        with apply_column:
-            if st.button('Apply changes', type='primary', width='stretch', disabled=not dirty):
-                try:
-                    with st.spinner('Applying your page corners and cleanup settings…'):
-                        apply_scan(studio, settings)
-                    dirty = False
-                except ValueError as error:
-                    studio['error'] = str(error)
-                except cv2.error:
-                    studio['error'] = 'Could not process this selection. Try wider corners or less cleanup.'
-        with reset_column:
-            st.button('Reset', on_click=reset_studio, width='stretch')
-        if studio['error']:
-            st.error(studio['error'])
-        if dirty:
-            st.warning('Unapplied edits: the preview is your last applied scan. Apply or reset to download.')
-
-    st.subheader('3. Compare and download')
-    if studio['corrected']:
-        boundary = 'Your page corners' if studio['applied_manual'] else 'Automatic page detection'
-        st.success(f"{boundary} applied · {studio['applied_settings']['style']} scan ready.")
-    else:
-        st.warning('The whole image is enhanced; perspective correction was skipped.')
-    compare_scans(
-        studio['before_uri'], studio['after_uri'], studio['scanned'].shape,
-        key=f"rescue_comparison_{studio['upload_id']}",
-    )
-    st.caption(
-        'Drag the divider or use the slider to compare the same page before and after cleanup. '
-        'Comparison movement does not rescan the image.'
-    )
-    height, width = studio['scanned'].shape[:2]
-    st.caption(f'{width} × {height} pixels · PNG download uses the applied scan resolution')
-    if not dirty and not studio['error']:
-        filename = Path(uploaded_file.name).stem or 'document'
+        st.subheader('Scanned result')
+        if studio['corrected']:
+            st.success('Scan ready. The page was detected and straightened automatically.')
+        else:
+            st.warning(
+                'No page boundary was found. Whole-image enhancement was used, and '
+                'perspective correction was skipped.'
+            )
+        st.caption(f"{studio['width']} × {studio['height']} pixels · Black-and-white PNG")
         st.download_button(
-            'Download scanned PNG', data=studio['png'], file_name=f'{filename}_scanned.png',
-            mime='image/png', on_click='ignore', type='primary',
+            'Download scanned PNG', data=studio['png'], file_name=studio['download_name'],
+            mime=studio['mime'], on_click='ignore', type='primary', width='stretch',
         )
+        st.image(studio['scanned'], width='stretch')
 
 
 if __name__ == '__main__':
