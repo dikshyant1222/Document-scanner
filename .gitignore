@@ -9,6 +9,7 @@ venv/
 *.jpeg
 *.png
 *.webp
+*.bmp
 *.mp4
 *.avi
 *.mov
